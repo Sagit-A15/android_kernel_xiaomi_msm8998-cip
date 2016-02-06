@@ -644,8 +644,8 @@ static int f_audio_bind(struct usb_configuration *c, struct usb_function *f)
 	audio->in_ep->desc = &as_in_ep_desc;
 
 	/* copy descriptors, and track endpoint copies */
-	status = usb_assign_descriptors(f, f_audio_desc, f_audio_desc,
-							f_audio_ss_desc);
+	status = usb_assign_descriptors(f, f_audio_desc, f_audio_desc, NULL,
+					NULL);
 	if (status)
 		goto fail;
 
