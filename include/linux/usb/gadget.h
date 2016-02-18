@@ -1429,6 +1429,7 @@ extern int usb_add_gadget_udc(struct device *parent, struct usb_gadget *gadget);
 extern void usb_del_gadget_udc(struct usb_gadget *gadget);
 extern int usb_udc_attach_driver(const char *name,
 		struct usb_gadget_driver *driver);
+extern char *usb_get_gadget_udc_name(void);
 
 /*-------------------------------------------------------------------------*/
 
