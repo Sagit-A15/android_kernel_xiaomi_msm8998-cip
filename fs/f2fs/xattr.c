@@ -175,28 +175,6 @@ static int f2fs_xattr_advise_set(const struct xattr_handler *handler,
 	return 0;
 }
 
-static struct inode *get_parent_inode(struct inode *inode)
-{
-	struct inode *dir = NULL;
-	struct dentry *dentry, *parent;
-
-	dentry = d_find_alias(inode);
-	if (!dentry)
-		goto out;
-
-	parent = dget_parent(dentry);
-	if (!parent)
-		goto out_dput;
-
-	dir = igrab(d_inode(parent));
-	dput(parent);
-
-out_dput:
-	dput(dentry);
-out:
-	return dir;
-}
-
 #ifdef CONFIG_F2FS_FS_SECURITY
 static int f2fs_initxattrs(struct inode *inode, const struct xattr *xattr_array,
 		void *page)
@@ -689,6 +667,7 @@ static int __f2fs_setxattr(struct inode *inode, int index,
 			const char *name, const void *value, size_t size,
 			struct page *ipage, int flags)
 {
+	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
 	struct f2fs_xattr_entry *here, *last;
 	void *base_addr, *last_base_addr;
 	nid_t xnid = F2FS_I(inode)->i_xattr_nid;
@@ -736,7 +715,7 @@ static int __f2fs_setxattr(struct inode *inode, int index,
 		}
 
 		if (value && f2fs_xattr_value_same(here, value, size))
-			goto exit;
+			goto same;
 	} else if ((flags & XATTR_REPLACE)) {
 		error = -ENODATA;
 		goto exit;
@@ -801,17 +780,29 @@ static int __f2fs_setxattr(struct inode *inode, int index,
 	if (error)
 		goto exit;
 
-	if (is_inode_flag_set(inode, FI_ACL_MODE)) {
-		inode->i_mode = F2FS_I(inode)->i_acl_mode;
-		inode->i_ctime = current_time(inode);
-		clear_inode_flag(inode, FI_ACL_MODE);
-	}
 	if (index == F2FS_XATTR_INDEX_ENCRYPTION &&
 			!strcmp(name, F2FS_XATTR_NAME_ENCRYPTION_CONTEXT))
 		f2fs_set_encrypted_inode(inode);
+
+	if (!S_ISDIR(inode->i_mode))
+		goto same;
+	/*
+	 * In restrict mode, fsync() always try to trigger checkpoint for all
+	 * metadata consistency, in other mode, it triggers checkpoint when
+	 * parent's xattr metadata was updated.
+	 */
+	if (F2FS_OPTION(sbi).fsync_mode == FSYNC_MODE_STRICT)
+		set_sbi_flag(sbi, SBI_NEED_CP);
+	else
+		f2fs_add_ino_entry(sbi, inode->i_ino, XATTR_DIR_INO);
+same:
+	if (is_inode_flag_set(inode, FI_ACL_MODE)) {
+		inode->i_mode = F2FS_I(inode)->i_acl_mode;
+		clear_inode_flag(inode, FI_ACL_MODE);
+	}
+
+	inode->i_ctime = current_time(inode);
 	f2fs_mark_inode_dirty_sync(inode, true);
-	if (!error && S_ISDIR(inode->i_mode))
-		f2fs_inode_xattr_set(inode);
 exit:
 	kvfree(base_addr);
 	return error;
@@ -873,52 +864,4 @@ int f2fs_init_xattr_caches(struct f2fs_sb_info *sbi)
 void f2fs_destroy_xattr_caches(struct f2fs_sb_info *sbi)
 {
 	kmem_cache_destroy(sbi->inline_xattr_slab);
-}
-
-void f2fs_inode_xattr_set(struct inode *inode)
-{
-	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
-	struct f2fs_inode_info *fi = F2FS_I(inode);
-
-	spin_lock(&sbi->xattr_set_dir_ilist_lock);
-	if (list_empty(&fi->xattr_dirty_list))
-		list_add_tail(&fi->xattr_dirty_list, &sbi->xattr_set_dir_ilist);
-	spin_unlock(&sbi->xattr_set_dir_ilist_lock);
-}
-
-void f2fs_remove_xattr_set_inode(struct inode *inode)
-{
-	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
-	struct f2fs_inode_info *fi = F2FS_I(inode);
-
-	spin_lock(&sbi->xattr_set_dir_ilist_lock);
-	if (!list_empty(&fi->xattr_dirty_list))
-		list_del_init(&fi->xattr_dirty_list);
-	spin_unlock(&sbi->xattr_set_dir_ilist_lock);
-}
-
-void f2fs_clear_xattr_set_ilist(struct f2fs_sb_info *sbi)
-{
-	struct list_head *pos, *n;
-
-	spin_lock(&sbi->xattr_set_dir_ilist_lock);
-	list_for_each_safe(pos, n, &sbi->xattr_set_dir_ilist)
-		list_del_init(pos);
-	spin_unlock(&sbi->xattr_set_dir_ilist_lock);
-}
-
-int f2fs_parent_inode_xattr_set(struct inode *inode)
-{
-	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
-	struct inode *dir = get_parent_inode(inode);
-	int ret = 0;
-
-	if (dir) {
-		spin_lock(&sbi->xattr_set_dir_ilist_lock);
-		ret = !list_empty(&F2FS_I(dir)->xattr_dirty_list);
-		spin_unlock(&sbi->xattr_set_dir_ilist_lock);
-		iput(dir);
-	}
-
-	return ret;
 }

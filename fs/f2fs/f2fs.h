@@ -276,7 +276,8 @@ enum {
 	ORPHAN_INO,		/* for orphan ino list */
 	APPEND_INO,		/* for append ino list */
 	UPDATE_INO,		/* for update ino list */
-	TRANS_DIR_INO,		/* for trasactions dir ino list */
+	TRANS_DIR_INO,		/* for transactions dir ino list */
+	XATTR_DIR_INO,		/* for xattr updated dir ino list */
 	FLUSH_INO,		/* for multiple device flushing */
 	MAX_INO_ENTRY,		/* max. list */
 };
@@ -854,7 +855,6 @@ struct f2fs_inode_info {
 	struct mutex inmem_lock;	/* lock for inmemory pages */
 	struct extent_tree *extent_tree[NR_EXTENT_CACHES];
 					/* cached extent_tree entry */
-	struct list_head xattr_dirty_list;	/* list for xattr changed inodes */
 
 	/* avoid racing between foreground op and gc */
 	struct rw_semaphore i_gc_rwsem[2];
@@ -1148,7 +1148,7 @@ enum cp_reason_type {
 	CP_FASTBOOT_MODE,
 	CP_SPEC_LOG_NUM,
 	CP_RECOVER_DIR,
-	CP_PARENT_XATTR_SET,
+	CP_XATTR_DIR,
 };
 
 enum iostat_type {
@@ -1359,8 +1359,6 @@ struct f2fs_sb_info {
 	struct list_head fsync_node_list;	/* node list head */
 	unsigned int fsync_seg_id;		/* sequence id */
 	unsigned int fsync_node_num;		/* number of node entries */
-	spinlock_t xattr_set_dir_ilist_lock;	/* lock for dir inode list*/
-	struct list_head xattr_set_dir_ilist;	/* xattr changed dir inode list */
 
 	/* for orphan inode, use 0'th array */
 	unsigned int max_orphans;		/* max orphan inodes */
@@ -3627,14 +3625,6 @@ int f2fs_read_inline_dir(struct file *file, struct dir_context *ctx,
 int f2fs_inline_data_fiemap(struct inode *inode,
 			struct fiemap_extent_info *fieinfo,
 			__u64 start, __u64 len);
-
-/*
- * xattr.c
- */
-void f2fs_inode_xattr_set(struct inode *inode);
-void f2fs_remove_xattr_set_inode(struct inode *inode);
-void f2fs_clear_xattr_set_ilist(struct f2fs_sb_info *sbi);
-int f2fs_parent_inode_xattr_set(struct inode *inode);
 
 /*
  * shrinker.c
