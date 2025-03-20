@@ -98,6 +98,7 @@ enum bpf_cmd {
 	BPF_MAP_GET_FD_BY_ID,
 	BPF_OBJ_GET_INFO_BY_FD,
 	BPF_PROG_QUERY,
+	BPF_RAW_TRACEPOINT_OPEN,
 	BPF_BTF_LOAD = 18,
 	BPF_BTF_GET_FD_BY_ID,
 	BPF_MAP_LOOKUP_AND_DELETE_ELEM = 21,
@@ -121,9 +122,11 @@ enum bpf_map_type {
 	BPF_MAP_TYPE_HASH_OF_MAPS,
 	BPF_MAP_TYPE_DEVMAP,
 	BPF_MAP_TYPE_SOCKMAP,
+	BPF_MAP_TYPE_CPUMAP,
 	BPF_MAP_TYPE_SOCKHASH = 18,
 	BPF_MAP_TYPE_CGROUP_STORAGE,
-	BPF_MAP_TYPE_QUEUE = 22,
+	BPF_MAP_TYPE_PERCPU_CGROUP_STORAGE = 21,
+	BPF_MAP_TYPE_QUEUE,
 	BPF_MAP_TYPE_STACK,
 	BPF_MAP_TYPE_SK_STORAGE,
 	BPF_MAP_TYPE_DEVMAP_HASH,
@@ -156,8 +159,11 @@ enum bpf_prog_type {
 	BPF_PROG_TYPE_SK_SKB,
 	BPF_PROG_TYPE_CGROUP_DEVICE,
 	BPF_PROG_TYPE_SK_MSG,
+	BPF_PROG_TYPE_RAW_TRACEPOINT = 17,
 	BPF_PROG_TYPE_CGROUP_SOCK_ADDR = 18,
+	BPF_PROG_TYPE_FLOW_DISSECTOR = 22,
 	BPF_PROG_TYPE_CGROUP_SYSCTL = 23,
+	BPF_PROG_TYPE_RAW_TRACEPOINT_WRITABLE = 24,
 	BPF_PROG_TYPE_CGROUP_SOCKOPT = 25,
 };
 
@@ -178,6 +184,7 @@ enum bpf_attach_type {
 	BPF_CGROUP_INET6_POST_BIND,
 	BPF_CGROUP_UDP4_SENDMSG,
 	BPF_CGROUP_UDP6_SENDMSG,
+	BPF_FLOW_DISSECTOR = 17,
 	BPF_CGROUP_SYSCTL = 18,
 	BPF_CGROUP_UDP4_RECVMSG,
 	BPF_CGROUP_UDP6_RECVMSG,
@@ -422,6 +429,11 @@ union bpf_attr {
 		__aligned_u64	prog_ids;
 		__u32		prog_cnt;
 	} query;
+
+	struct {
+ 		__u64 name;
+ 		__u32 prog_fd;
+ 	} raw_tracepoint;
 
 	struct { /* anonymous struct for BPF_BTF_LOAD */
 		__aligned_u64	btf;
@@ -1600,6 +1612,8 @@ struct __sk_buff {
 	__u32 data_meta;
 	__u32 wire_len;
 	__bpf_md_ptr(struct bpf_sock *, sk);
+
+	struct bpf_flow_keys *flow_keys;
 };
 
 struct bpf_tunnel_key {
@@ -2028,6 +2042,33 @@ struct bpf_sockopt {
 	__s32	optname;
 	__s32	optlen;
 	__s32	retval;
+};
+
+struct bpf_raw_tracepoint_args {
+ 	__u64 args[0];
+};
+
+struct bpf_flow_keys {
+ 	__u16	nhoff;
+ 	__u16	thoff;
+ 	__u16	addr_proto;			/* ETH_P_* of valid addrs */
+ 	__u8	is_frag;
+ 	__u8	is_first_frag;
+ 	__u8	is_encap;
+ 	__u8	ip_proto;
+ 	__be16	n_proto;
+ 	__be16	sport;
+ 	__be16	dport;
+ 	union {
+ 		struct {
+ 			__be32	ipv4_src;
+ 			__be32	ipv4_dst;
+ 		};
+ 		struct {
+ 			__u32	ipv6_src[4];	/* in6_addr; network order */
+ 			__u32	ipv6_dst[4];	/* in6_addr; network order */
+ 		};
+ 	};
 };
 
 #endif /* _UAPI__LINUX_BPF_H__ */

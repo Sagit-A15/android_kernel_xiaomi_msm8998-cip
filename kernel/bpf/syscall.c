@@ -547,6 +547,7 @@ static int bpf_obj_name_cpy(char *dst, const char *src)
 }
 
 int map_check_no_btf(const struct bpf_map *map,
+		     const struct btf *btf,
 		     const struct btf_type *key_type,
 		     const struct btf_type *value_type)
 {
@@ -586,7 +587,7 @@ static int map_check_btf(struct bpf_map *map, const struct btf *btf,
 	}
 
 	if (map->ops->map_check_btf)
-		ret = map->ops->map_check_btf(map, key_type, value_type);
+		ret = map->ops->map_check_btf(map, btf, key_type, value_type);
 
 	return ret;
 }
@@ -815,7 +816,8 @@ static int map_lookup_elem(union bpf_attr *attr)
 
 	if (map->map_type == BPF_MAP_TYPE_PERCPU_HASH ||
 	    map->map_type == BPF_MAP_TYPE_LRU_PERCPU_HASH ||
-	    map->map_type == BPF_MAP_TYPE_PERCPU_ARRAY)
+	    map->map_type == BPF_MAP_TYPE_PERCPU_ARRAY ||
+ 	    map->map_type == BPF_MAP_TYPE_PERCPU_CGROUP_STORAGE)
 		value_size = round_up(map->value_size, 8) * num_possible_cpus();
 	else if (IS_FD_MAP(map))
 		value_size = sizeof(u32);
@@ -839,8 +841,13 @@ static int map_lookup_elem(union bpf_attr *attr)
 		err = bpf_percpu_hash_copy(map, key, value);
 	} else if (map->map_type == BPF_MAP_TYPE_PERCPU_ARRAY) {
 		err = bpf_percpu_array_copy(map, key, value);
+	} else if (map->map_type == BPF_MAP_TYPE_PERCPU_CGROUP_STORAGE) {
+ 		err = bpf_percpu_cgroup_storage_copy(map, key, value);
 	} else if (map->map_type == BPF_MAP_TYPE_STACK_TRACE) {
 		err = bpf_stackmap_copy(map, key, value);
+	} else if (map->map_type == BPF_MAP_TYPE_PERCPU_CGROUP_STORAGE) {
+ 		err = bpf_percpu_cgroup_storage_update(map, key, value,
+ 						       attr->flags);
 	} else if (IS_FD_ARRAY(map)) {
 		err = bpf_fd_array_map_lookup_elem(map, key, value);
 	} else if (IS_FD_HASH(map)) {
@@ -929,7 +936,8 @@ static int map_update_elem(union bpf_attr *attr)
 
 	if (map->map_type == BPF_MAP_TYPE_PERCPU_HASH ||
 	    map->map_type == BPF_MAP_TYPE_LRU_PERCPU_HASH ||
-	    map->map_type == BPF_MAP_TYPE_PERCPU_ARRAY)
+	    map->map_type == BPF_MAP_TYPE_PERCPU_ARRAY ||
+ 	    map->map_type == BPF_MAP_TYPE_PERCPU_CGROUP_STORAGE)
 		value_size = round_up(map->value_size, 8) * num_possible_cpus();
 	else
 		value_size = map->value_size;
@@ -951,6 +959,12 @@ static int map_update_elem(union bpf_attr *attr)
 		err = map->ops->map_update_elem(map, key, value, attr->flags);
 		goto out;
 	}
+
+	/* Need to create a kthread, thus must support schedule */
+ 	if (map->map_type == BPF_MAP_TYPE_CPUMAP) {
+ 		err = map->ops->map_update_elem(map, key, value, attr->flags);
+ 		goto out;
+ 	}
 
 	/* must increment bpf_prog_active to avoid kprobe+bpf triggering from
 	 * inside bpf map update or delete otherwise deadlocks are possible
@@ -1239,10 +1253,15 @@ static int find_prog_type(enum bpf_prog_type type, struct bpf_prog *prog)
 /* drop refcnt on maps used by eBPF program and free auxilary data */
 static void free_used_maps(struct bpf_prog_aux *aux)
 {
+	enum bpf_cgroup_storage_type stype;
 	int i;
 
-	if (aux->cgroup_storage)
-		bpf_cgroup_storage_release(aux->prog, aux->cgroup_storage);
+	for_each_cgroup_storage_type(stype) {
+ 		if (!aux->cgroup_storage[stype])
+ 			continue;
+ 		bpf_cgroup_storage_release(aux->prog,
+ 					   aux->cgroup_storage[stype]);
+ 	}
 
 	for (i = 0; i < aux->used_map_cnt; i++)
 		bpf_map_put(aux->used_maps[i]);
@@ -1766,6 +1785,85 @@ static int bpf_prog_attach_check_attach_type(const struct bpf_prog *prog,
 	}
 }
 
+struct bpf_raw_tracepoint {
+ 	struct bpf_raw_event_map *btp;
+ 	struct bpf_prog *prog;
+};
+
+static int bpf_raw_tracepoint_release(struct inode *inode, struct file *filp)
+{
+ 	struct bpf_raw_tracepoint *raw_tp = filp->private_data;
+ 
+ 	if (raw_tp->prog) {
+ 		bpf_probe_unregister(raw_tp->btp, raw_tp->prog);
+ 		bpf_prog_put(raw_tp->prog);
+ 	}
+ 	kfree(raw_tp);
+ 	return 0;
+ }
+
+static const struct file_operations bpf_raw_tp_fops = {
+ 	.release        = bpf_raw_tracepoint_release,
+ 	.read           = bpf_dummy_read,
+ 	.write          = bpf_dummy_write,
+};
+
+#define BPF_RAW_TRACEPOINT_OPEN_LAST_FIELD raw_tracepoint.prog_fd
+static int bpf_raw_tracepoint_open(const union bpf_attr *attr)
+{
+ 	struct bpf_raw_tracepoint *raw_tp;
+ 	struct bpf_raw_event_map *btp;
+ 	struct bpf_prog *prog;
+ 	char tp_name[128];
+ 	int tp_fd, err;
+
+ 	if (strncpy_from_user(tp_name, u64_to_user_ptr(attr->raw_tracepoint.name),
+ 			sizeof(tp_name) - 1) < 0)
+ 		return -EFAULT;
+ 	tp_name[sizeof(tp_name) - 1] = 0;
+
+ 	btp = bpf_find_raw_tracepoint(tp_name);
+ 	if (!btp)
+ 		return -ENOENT;
+
+ 	raw_tp = kzalloc(sizeof(*raw_tp), GFP_USER);
+ 	if (!raw_tp)
+ 		return -ENOMEM;
+ 	raw_tp->btp = btp;
+
+	prog = bpf_prog_get(attr->raw_tracepoint.prog_fd);
+ 	if (IS_ERR(prog)) {
+ 		err = PTR_ERR(prog);
+ 		goto out_free_tp;
+ 	}
+
+	if (prog->type != BPF_PROG_TYPE_RAW_TRACEPOINT &&
+ 	    prog->type != BPF_PROG_TYPE_RAW_TRACEPOINT_WRITABLE) {
+ 		err = -EINVAL;
+ 		goto out_put_prog;
+ 	}
+
+ 	err = bpf_probe_register(raw_tp->btp, prog);
+ 	if (err)
+ 		goto out_put_prog;
+
+ 	raw_tp->prog = prog;
+ 	tp_fd = anon_inode_getfd("bpf-raw-tracepoint", &bpf_raw_tp_fops, raw_tp,
+ 			O_CLOEXEC);
+ 	if (tp_fd < 0) {
+ 		bpf_probe_unregister(raw_tp->btp, prog);
+ 		err = tp_fd;
+ 		goto out_put_prog;
+ 	}
+ 	return tp_fd;
+
+out_put_prog:
+ 	bpf_prog_put(prog);
+out_free_tp:
+ 	kfree(raw_tp);
+ 	return err;
+}
+
 #define BPF_PROG_ATTACH_LAST_FIELD attach_flags
 
 #define BPF_F_ATTACH_MASK \
@@ -1818,6 +1916,9 @@ static int bpf_prog_attach(const union bpf_attr *attr)
 	case BPF_SK_SKB_STREAM_PARSER:
 	case BPF_SK_SKB_STREAM_VERDICT:
 		ptype = BPF_PROG_TYPE_SK_SKB;
+	case BPF_FLOW_DISSECTOR:
+ 		ptype = BPF_PROG_TYPE_FLOW_DISSECTOR;
+ 		break;
 	case BPF_CGROUP_SYSCTL:
 		ptype = BPF_PROG_TYPE_CGROUP_SYSCTL;
 		break;
@@ -1895,6 +1996,8 @@ static int bpf_prog_detach(const union bpf_attr *attr)
 	case BPF_SK_SKB_STREAM_PARSER:
 	case BPF_SK_SKB_STREAM_VERDICT:
 		return sockmap_get_from_fd(attr, BPF_PROG_TYPE_SK_SKB, NULL);
+	case BPF_FLOW_DISSECTOR:
+ 		return skb_flow_dissector_bpf_prog_detach(attr);
 	case BPF_CGROUP_SYSCTL:
 		ptype = BPF_PROG_TYPE_CGROUP_SYSCTL;
 		break;
@@ -2601,6 +2704,9 @@ SYSCALL_DEFINE3(bpf, int, cmd, union bpf_attr __user *, uattr, unsigned int, siz
 	case BPF_OBJ_GET_INFO_BY_FD:
 		err = bpf_obj_get_info_by_fd(&attr, uattr);
 		break;
+	case BPF_RAW_TRACEPOINT_OPEN:
+ 		err = bpf_raw_tracepoint_open(&attr);
+ 		break;
 	case BPF_BTF_LOAD:
 		err = bpf_btf_load(&attr);
 		break;
